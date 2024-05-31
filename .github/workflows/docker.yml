@@ -1,0 +1,231 @@
+name: "Build multi-arch Docker images"
+
+on:
+  push:
+    branches:
+      - "master"
+
+jobs:
+  start-amd64-runner:
+    name: "Start self-hosted EC2 runner"
+    runs-on: "ubuntu-latest"
+    outputs:
+      label: ${{ steps.start-ec2-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
+
+    steps:
+      - name: "Configure AWS credentials"
+        uses: "aws-actions/configure-aws-credentials@v1"
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: "Start EC2 runner"
+        id: "start-ec2-runner"
+        uses: "xJonathanLEI/ec2-github-runner@main"
+        with:
+          mode: "start"
+          github-token: ${{ secrets.GH_PAT }}
+          ec2-image-id: "ami-0083d3f8b2a6c7a81"
+          ec2-instance-type: "c5.4xlarge"
+          subnet-id: "subnet-0f178a06b3c5e09dd"
+          security-group-id: "sg-0db4b2850585ebe80"
+          storage-size: 256
+
+  start-arm64-runner:
+    name: "Start self-hosted EC2 runner"
+    runs-on: "ubuntu-latest"
+    outputs:
+      label: ${{ steps.start-ec2-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
+
+    steps:
+      - name: "Configure AWS credentials"
+        uses: "aws-actions/configure-aws-credentials@v1"
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: "Start EC2 runner"
+        id: "start-ec2-runner"
+        uses: "xJonathanLEI/ec2-github-runner@main"
+        with:
+          mode: "start"
+          github-token: ${{ secrets.GH_PAT }}
+          ec2-image-id: "ami-01a786eb497a27d2a"
+          ec2-instance-type: "c6g.4xlarge"
+          subnet-id: "subnet-0f178a06b3c5e09dd"
+          security-group-id: "sg-0db4b2850585ebe80"
+          storage-size: 256
+
+  meta:
+    name: "Extract metadata"
+    runs-on: "ubuntu-latest"
+    outputs:
+      commit: ${{ steps.derive.outputs.commit }}
+      image_tag: ${{ steps.derive.outputs.image_tag }}
+
+    env:
+      DOCKER_REPOSITORY: "xjonathanlei/zulip"
+
+    steps:
+      - name: "Checkout"
+        uses: "actions/checkout@v3"
+
+      - id: "derive"
+        name: "Determine metadata"
+        run: |
+          source ./env
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+          echo "image_tag=$DOCKER_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  build:
+    name: "Build for ${{ matrix.name }}"
+    runs-on: "${{ matrix.runner }}"
+    needs:
+      - "meta"
+      - "start-amd64-runner"
+      - "start-arm64-runner"
+
+    strategy:
+      matrix:
+        include:
+          - name: "linux/amd64"
+            arch: "amd64"
+            runner: "${{ needs.start-amd64-runner.outputs.label }}"
+          - name: "linux/arm64"
+            arch: "arm64"
+            runner: "${{ needs.start-arm64-runner.outputs.label }}"
+
+    steps:
+      - name: "Install Docker"
+        run: |
+          # Add Docker's official GPG key:
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+          # Add the repository to Apt sources:
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+            $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+            sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update
+
+          # Install the latest version
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+      - name: "Clone docker-zulip"
+        run: |
+          git clone --recursive https://github.com/zulip/docker-zulip
+          cd ./docker-zulip
+          git checkout ${{ needs.meta.outputs.commit }}
+
+      - name: "Build Docker image"
+        run: |
+          cd ./docker-zulip
+          docker build \
+              -t ${{ needs.meta.outputs.image_tag }}-${{ matrix.arch }} \
+              .
+
+      - name: "Export Docker image"
+        run: |
+          docker save ${{ needs.meta.outputs.image_tag }}-${{ matrix.arch }} | gzip > /tmp/${{ matrix.arch }}.tar.gz
+
+      - name: "Upload Docker image artifact"
+        uses: "actions/upload-artifact@v3"
+        with:
+          name: "${{ matrix.arch }}.tar.gz"
+          path: "/tmp/${{ matrix.arch }}.tar.gz"
+
+  push:
+    name: "Push Docker images"
+    runs-on: "ubuntu-latest"
+    needs:
+      - "meta"
+      - "build"
+
+    steps:
+      - name: "Download linux/amd64 image"
+        uses: "actions/download-artifact@v3"
+        with:
+          name: "amd64.tar.gz"
+          path: "/tmp/"
+
+      - name: "Download linux/arm64/v8 image"
+        uses: "actions/download-artifact@v3"
+        with:
+          name: "arm64.tar.gz"
+          path: "/tmp/"
+
+      - name: "Load Docker images"
+        run: |
+          docker load < /tmp/amd64.tar.gz
+          docker load < /tmp/arm64.tar.gz
+
+      - name: "Login to Docker Hub"
+        uses: "docker/login-action@v1.6.0"
+        with:
+          username: "${{ secrets.DOCKER_HUB_USERNAME }}"
+          password: "${{ secrets.DOCKER_HUB_PASSWORD }}"
+
+      - name: "Push Docker images"
+        run: |
+          docker push ${{ needs.meta.outputs.image_tag }}-amd64
+          docker push ${{ needs.meta.outputs.image_tag }}-arm64
+          docker manifest create ${{ needs.meta.outputs.image_tag }} \
+            ${{ needs.meta.outputs.image_tag }}-amd64 \
+            ${{ needs.meta.outputs.image_tag }}-arm64
+          docker manifest push ${{ needs.meta.outputs.image_tag }}
+
+  stop-amd64-runner:
+    name: "Stop self-hosted EC2 runner"
+    runs-on: "ubuntu-latest"
+    needs:
+      - "start-amd64-runner"
+      - "build"
+    if: ${{ always() }}
+
+    steps:
+      - name: "Configure AWS credentials"
+        uses: "aws-actions/configure-aws-credentials@v1"
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: "Stop EC2 runner"
+        uses: "xJonathanLEI/ec2-github-runner@main"
+        with:
+          mode: "stop"
+          github-token: ${{ secrets.GH_PAT }}
+          label: "${{ needs.start-amd64-runner.outputs.label }}"
+          ec2-instance-id: "${{ needs.start-amd64-runner.outputs.ec2-instance-id }}"
+
+  stop-arm64-runner:
+    name: "Stop self-hosted EC2 runner"
+    runs-on: "ubuntu-latest"
+    needs:
+      - "start-arm64-runner"
+      - "build"
+    if: ${{ always() }}
+
+    steps:
+      - name: "Configure AWS credentials"
+        uses: "aws-actions/configure-aws-credentials@v1"
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: "Stop EC2 runner"
+        uses: "xJonathanLEI/ec2-github-runner@main"
+        with:
+          mode: "stop"
+          github-token: ${{ secrets.GH_PAT }}
+          label: "${{ needs.start-arm64-runner.outputs.label }}"
+          ec2-instance-id: "${{ needs.start-arm64-runner.outputs.ec2-instance-id }}"
