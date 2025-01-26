@@ -1,2 +1,2 @@
-export COMMIT=65461b5f5356dad3d0dfb7e7b453965bc2d9d132
-export IMAGE_TAG=9.1-3
+export COMMIT=c7113f59b40c89ba0bbef9593c257140b5f1af43
+export IMAGE_TAG=9.2-0
